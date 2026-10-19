@@ -83,22 +83,6 @@ Test  = GEO only
 
 Before classification, TCGA and GEO samples are aligned independently using a sample-wise rank-normal transformation.
 
-For each sample:
-
-\[
-r_j = \operatorname{rank}(x_j)
-\]
-
-\[
-p_j = \frac{r_j - 0.5}{m}
-\]
-
-\[
-z_j = \Phi^{-1}(p_j)
-\]
-
-where \(m\) is the number of valid features in the sample.
-
 This transformation places samples from different platforms on a common rank-based scale without using the test-set distribution to normalize the training data.
 
 The `figure/` directory contains diagnostic plots before and after alignment.
