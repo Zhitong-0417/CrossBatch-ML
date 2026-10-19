@@ -1,0 +1,1195 @@
+---
+title: "DeepCC CRC Scenario 1: CMS4 vs Others, GSE13067 to GSE13294, Internal Microarray Platform SSV"
+output: html_document
+---
+
+# 0) Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(AnnotationDbi)
+  library(hgu133plus2.db)
+  library(ggplot2)
+})
+
+set.seed(20260421)
+
+# Do not modify this file. It contains ml_sum(), result_plot(), and result_plot2().
+source("SSV summary.R")
+
+result_dir <- "results_deepcc_gse13067_to_gse13294_internal_platform"
+dir.create(result_dir, showWarnings = FALSE, recursive = TRUE)
+
+cat("Setup done.\n")
+cat("Working directory:", getwd(), "\n")
+cat("Result directory:", result_dir, "\n")
+```
+
+# 1) Design
+
+This file uses DeepCC CRC scenario 1 as a binary SSV adaptation within a microarray-only setting:
+
+-   `class_id = 1`: CMS4
+-   `class_id = 0`: Others = CMS1 + CMS2 + CMS3
+-   `batch_id = 1`: GSE13067 RMA microarray
+-   `batch_id = 2`: GSE13294 RMA microarray
+-   `split = 100`: strict internal-platform cross-dataset validation, GSE13067 as train-like batch and GSE13294 as external batch.
+
+Compared with the TCGA-to-GEO files, this workflow is simplified because both expression files are already RMA microarray matrices with the same Affymetrix probe ID structure. Therefore:
+
+1.  No TCGA parser is used.
+2.  No TCGA primary-tumor filtering is needed.
+3.  No RNA-seq-to-microarray scale alignment is required by default.
+4.  Feature selection is still based on batch 1 only, GSE13067, to avoid using batch 2 expression values to choose classifier features.
+
+The optional `internal_alignment_method` is kept for diagnostics. The default is `"none"`, because both inputs are RMA log-scale microarray data. If the raw RMA distributions are still too different, you can change it to `"sample_rank_normal"`.
+
+# 2) Parameters
+
+```{r parameters}
+gse13067_expr_path <- "validation_s1/gse13067_rma_expression.tsv"
+gse13294_expr_path <- "validation_s1/gse13294_rma_expression.tsv"
+label_path <- "label/cms_labels_public_all.txt"
+
+batch1_dataset_name <- "gse13067"
+batch2_dataset_name <- "gse13294"
+
+valid_cms <- c("CMS1", "CMS2", "CMS3", "CMS4")
+binary_positive_class <- "CMS4"
+binary_negative_class <- "Others"
+
+# ml_sum settings
+split_combination <- c(50, 70, 80, 90, 100)
+times <- 10
+ml_methods <- c("knn", "lasso", "svm", "pam", "rf", "xgb")
+batch_balance <- FALSE
+
+# Feature selection is based on batch 1 only to avoid batch 2 leakage.
+feature_selection_method <- "top_batch1_mean"
+top_n_features <- 1500
+
+# Internal-platform alignment.
+# Recommended default here: "none", because both datasets are RMA microarray log-scale.
+# Optional alternatives: "sample_rank_normal", "sample_zscore".
+internal_alignment_method <- "none"
+
+file_prefix <- file.path(result_dir, "deepcc_gse13067_to_gse13294_CMS4_vs_Others_internal_platform")
+
+cat("Batch 1 expression path:", gse13067_expr_path, "\n")
+cat("Batch 2 expression path:", gse13294_expr_path, "\n")
+cat("Label path:", label_path, "\n")
+cat("Binary class:", binary_positive_class, "vs", binary_negative_class, "\n")
+cat("Feature selection:", feature_selection_method, "top_n =", top_n_features, "\n")
+cat("Internal alignment method:", internal_alignment_method, "\n")
+cat("File prefix:", file_prefix, "\n")
+```
+
+# 3) Helper functions
+
+```{r helper-functions}
+to_numeric_matrix <- function(df_like) {
+  mat <- as.matrix(df_like)
+  mode(mat) <- "numeric"
+  mat
+}
+
+clean_geo_sample_id <- function(x) {
+  x |>
+    gsub("\\.CEL$", "", x = _, ignore.case = TRUE) |>
+    trimws()
+}
+
+read_rma_expr_no_gene_header <- function(path, dataset_label) {
+  if (!file.exists(path)) stop("Cannot find expression file for ", dataset_label, ": ", path)
+
+  lines <- readLines(path, warn = FALSE)
+  if (length(lines) < 2) stop("Expression file format unexpected for ", dataset_label, ": less than 2 lines.")
+
+  sample_ids <- strsplit(lines[1], "\t", fixed = TRUE)[[1]]
+
+  body <- read.delim(
+    text = paste(lines[-1], collapse = "\n"),
+    header = FALSE,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+
+  if (ncol(body) != length(sample_ids) + 1) {
+    stop("Parse mismatch for ", dataset_label, ": body columns do not match sample header columns.")
+  }
+
+  colnames(body) <- c("probe_id", sample_ids)
+  body$probe_id <- as.character(body$probe_id)
+  body <- body[!duplicated(body$probe_id), , drop = FALSE]
+  body
+}
+
+collapse_gse_probe_to_symbol <- function(mat, dataset_label) {
+  probe_ids <- rownames(mat)
+
+  symbol_map <- AnnotationDbi::mapIds(
+    hgu133plus2.db,
+    keys = probe_ids,
+    column = "SYMBOL",
+    keytype = "PROBEID",
+    multiVals = "first"
+  )
+
+  keep <- !is.na(symbol_map) & symbol_map != ""
+  cat(dataset_label, "mapped probes:", sum(keep), "out of", length(probe_ids), "\n")
+
+  mat2 <- mat[keep, , drop = FALSE]
+  gene_symbol <- unname(symbol_map[keep])
+
+  df <- as.data.frame(mat2, check.names = FALSE)
+  df$gene_symbol <- gene_symbol
+
+  df <- df |>
+    dplyr::group_by(gene_symbol) |>
+    dplyr::summarise(
+      dplyr::across(dplyr::everything(), ~ mean(.x, na.rm = TRUE)),
+      .groups = "drop"
+    )
+
+  out <- as.data.frame(df, check.names = FALSE)
+  rownames(out) <- out$gene_symbol
+  out$gene_symbol <- NULL
+  as.matrix(out)
+}
+
+matrix_diagnostics <- function(mat, name, n_show = 5) {
+  mat <- as.matrix(mat)
+  cat("\n--- Diagnostics:", name, "---\n")
+  cat("dim:", paste(dim(mat), collapse = " x "), "\n")
+  cat("NA count:", sum(is.na(mat)), "\n")
+  cat("Non-finite count:", sum(!is.finite(mat)), "\n")
+  cat("Value summary:\n")
+  print(summary(as.numeric(mat)))
+  cat("Sample median summary:\n")
+  print(summary(apply(mat, 2, median, na.rm = TRUE)))
+  cat("Sample sd summary:\n")
+  print(summary(apply(mat, 2, sd, na.rm = TRUE)))
+  cat("Gene mean summary:\n")
+  print(summary(rowMeans(mat, na.rm = TRUE)))
+  cat("First genes:", paste(head(rownames(mat), n_show), collapse = ", "), "\n")
+  cat("First samples:", paste(head(colnames(mat), n_show), collapse = ", "), "\n")
+}
+
+sample_rank_normalize <- function(mat) {
+  mat <- as.matrix(mat)
+  mode(mat) <- "numeric"
+
+  out <- apply(mat, 2, function(x) {
+    ok <- is.finite(x)
+    z <- rep(NA_real_, length(x))
+    if (sum(ok) <= 1) {
+      z[ok] <- 0
+    } else {
+      r <- rank(x[ok], ties.method = "average", na.last = "keep")
+      p <- (r - 0.5) / sum(ok)
+      z[ok] <- qnorm(p)
+    }
+    z
+  })
+
+  out <- as.matrix(out)
+  rownames(out) <- rownames(mat)
+  colnames(out) <- colnames(mat)
+  out
+}
+
+sample_zscore <- function(mat) {
+  mat <- as.matrix(mat)
+  mode(mat) <- "numeric"
+
+  out <- apply(mat, 2, function(x) {
+    mu <- mean(x, na.rm = TRUE)
+    sdv <- sd(x, na.rm = TRUE)
+    if (!is.finite(sdv) || sdv == 0) sdv <- 1
+    (x - mu) / sdv
+  })
+
+  out <- as.matrix(out)
+  rownames(out) <- rownames(mat)
+  colnames(out) <- colnames(mat)
+  out
+}
+
+apply_internal_alignment <- function(batch1_mat, batch2_mat, method) {
+  if (method == "none") {
+    list(batch1 = batch1_mat, batch2 = batch2_mat)
+  } else if (method == "sample_rank_normal") {
+    list(batch1 = sample_rank_normalize(batch1_mat), batch2 = sample_rank_normalize(batch2_mat))
+  } else if (method == "sample_zscore") {
+    list(batch1 = sample_zscore(batch1_mat), batch2 = sample_zscore(batch2_mat))
+  } else {
+    stop("Unknown internal alignment method: ", method)
+  }
+}
+
+remove_bad_features <- function(mat) {
+  mat <- as.matrix(mat)
+  keep_finite <- rowSums(is.finite(mat)) == ncol(mat)
+  keep_var <- apply(mat, 1, sd, na.rm = TRUE) > 0
+  keep <- keep_finite & keep_var
+  out <- mat[keep, , drop = FALSE]
+  list(data = out, keep = keep)
+}
+```
+
+# 4) Read CMS labels
+
+```{r read-labels}
+labels_raw <- read.delim(
+  label_path,
+  sep = "\t",
+  header = TRUE,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+label_col <- "CMS_final_network_plus_RFclassifier_in_nonconsensus_samples"
+if (!(label_col %in% colnames(labels_raw))) {
+  stop("Cannot find CMS label column: ", label_col)
+}
+
+labels <- labels_raw |>
+  dplyr::transmute(
+    sample = as.character(sample),
+    dataset = tolower(as.character(dataset)),
+    CMS = as.character(.data[[label_col]])
+  ) |>
+  dplyr::filter(!is.na(CMS), CMS %in% valid_cms) |>
+  dplyr::mutate(
+    CMS_binary_text = ifelse(CMS == binary_positive_class, binary_positive_class, binary_negative_class),
+    class_id = ifelse(CMS == binary_positive_class, 1, 0)
+  )
+
+cat("Label table loaded.\n")
+cat("Total valid CMS labels:", nrow(labels), "\n")
+cat("Dataset distribution in label file:\n")
+print(table(labels$dataset))
+cat("Original CMS distribution in all labels:\n")
+print(table(labels$CMS))
+cat("Binary CMS distribution in all labels:\n")
+print(table(labels$CMS_binary_text))
+
+cat("Target dataset labels:\n")
+print(table(labels$dataset[labels$dataset %in% c(batch1_dataset_name, batch2_dataset_name)]))
+```
+
+# 5) Read RMA expression data and inspect file characteristics
+
+```{r read-expression}
+gse13067_raw_internal <- read_rma_expr_no_gene_header(gse13067_expr_path, batch1_dataset_name)
+gse13294_raw_internal <- read_rma_expr_no_gene_header(gse13294_expr_path, batch2_dataset_name)
+
+cat("GSE13067 raw data.frame dim:", paste(dim(gse13067_raw_internal), collapse = " x "), "\n")
+cat("GSE13294 raw data.frame dim:", paste(dim(gse13294_raw_internal), collapse = " x "), "\n")
+cat("GSE13067 preview:\n")
+print(gse13067_raw_internal[1:3, 1:min(6, ncol(gse13067_raw_internal))])
+cat("GSE13294 preview:\n")
+print(gse13294_raw_internal[1:3, 1:min(6, ncol(gse13294_raw_internal))])
+
+gse13067_probe_mat_internal <- gse13067_raw_internal |>
+  tibble::column_to_rownames("probe_id") |>
+  to_numeric_matrix()
+
+gse13294_probe_mat_internal <- gse13294_raw_internal |>
+  tibble::column_to_rownames("probe_id") |>
+  to_numeric_matrix()
+
+cat("Both files are treated as RMA log-scale microarray matrices. No extra log transform is applied.\n")
+cat("Common probe count before gene-symbol collapse:", length(intersect(rownames(gse13067_probe_mat_internal), rownames(gse13294_probe_mat_internal))), "\n")
+
+matrix_diagnostics(gse13067_probe_mat_internal, "GSE13067 RMA probe matrix")
+matrix_diagnostics(gse13294_probe_mat_internal, "GSE13294 RMA probe matrix")
+```
+
+# 6) Probe-to-gene harmonization and common-gene restriction
+
+```{r gene-symbol-harmonization}
+gse13067_symbol_mat_internal <- collapse_gse_probe_to_symbol(gse13067_probe_mat_internal, "GSE13067")
+gse13294_symbol_mat_internal <- collapse_gse_probe_to_symbol(gse13294_probe_mat_internal, "GSE13294")
+
+matrix_diagnostics(gse13067_symbol_mat_internal, "GSE13067 gene-symbol matrix")
+matrix_diagnostics(gse13294_symbol_mat_internal, "GSE13294 gene-symbol matrix")
+
+common_genes_internal <- intersect(rownames(gse13067_symbol_mat_internal), rownames(gse13294_symbol_mat_internal))
+cat("GSE13067 gene count:", nrow(gse13067_symbol_mat_internal), "\n")
+cat("GSE13294 gene count:", nrow(gse13294_symbol_mat_internal), "\n")
+cat("Common gene count:", length(common_genes_internal), "\n")
+cat("Common gene preview:\n")
+print(head(common_genes_internal, 30))
+
+if (length(common_genes_internal) < 500) {
+  stop("Too few common genes after harmonization. Check probe IDs and annotation package.")
+}
+
+gse13067_common_internal <- gse13067_symbol_mat_internal[common_genes_internal, , drop = FALSE]
+gse13294_common_internal <- gse13294_symbol_mat_internal[common_genes_internal, , drop = FALSE]
+
+matrix_diagnostics(gse13067_common_internal, "GSE13067 common genes before sample matching")
+matrix_diagnostics(gse13294_common_internal, "GSE13294 common genes before sample matching")
+```
+
+# 7) Sample alignment with CMS labels
+
+```{r sample-alignment}
+gse13067_meta_internal <- tibble::tibble(
+  sample_original = colnames(gse13067_common_internal),
+  sample_lookup = clean_geo_sample_id(colnames(gse13067_common_internal)),
+  dataset = batch1_dataset_name
+) |>
+  dplyr::inner_join(
+    labels |>
+      dplyr::filter(dataset == batch1_dataset_name) |>
+      dplyr::rename(sample_lookup = sample),
+    by = c("sample_lookup", "dataset")
+  )
+
+gse13294_meta_internal <- tibble::tibble(
+  sample_original = colnames(gse13294_common_internal),
+  sample_lookup = clean_geo_sample_id(colnames(gse13294_common_internal)),
+  dataset = batch2_dataset_name
+) |>
+  dplyr::inner_join(
+    labels |>
+      dplyr::filter(dataset == batch2_dataset_name) |>
+      dplyr::rename(sample_lookup = sample),
+    by = c("sample_lookup", "dataset")
+  )
+
+cat("Matched GSE13067 samples:", nrow(gse13067_meta_internal), "\n")
+cat("Matched GSE13294 samples:", nrow(gse13294_meta_internal), "\n")
+
+if (nrow(gse13067_meta_internal) == 0 || nrow(gse13294_meta_internal) == 0) {
+  stop("Sample alignment failed: no matched samples for GSE13067 or GSE13294.")
+}
+
+cat("GSE13067 CMS distribution after matching:\n")
+print(table(gse13067_meta_internal$CMS))
+cat("GSE13067 binary class distribution after matching:\n")
+print(table(gse13067_meta_internal$class_id))
+cat("GSE13294 CMS distribution after matching:\n")
+print(table(gse13294_meta_internal$CMS))
+cat("GSE13294 binary class distribution after matching:\n")
+print(table(gse13294_meta_internal$class_id))
+
+gse13067_common_matched_internal <- gse13067_common_internal[, gse13067_meta_internal$sample_original, drop = FALSE]
+gse13294_common_matched_internal <- gse13294_common_internal[, gse13294_meta_internal$sample_original, drop = FALSE]
+
+stopifnot(identical(colnames(gse13067_common_matched_internal), gse13067_meta_internal$sample_original))
+stopifnot(identical(colnames(gse13294_common_matched_internal), gse13294_meta_internal$sample_original))
+
+matrix_diagnostics(gse13067_common_matched_internal, "GSE13067 common genes matched samples")
+matrix_diagnostics(gse13294_common_matched_internal, "GSE13294 common genes matched samples")
+```
+
+# 8) Batch1-only feature selection
+
+```{r batch1-only-feature-selection}
+# Select high-expression features using GSE13067 only.
+# This avoids using GSE13294 expression values to decide which genes enter the classifier.
+batch1_gene_means_internal <- rowMeans(gse13294_common_matched_internal, na.rm = TRUE)
+
+cat("Batch1-only gene mean summary before feature selection:\n")
+print(summary(batch1_gene_means_internal))
+cat("Batch1-only gene mean quantiles:\n")
+print(quantile(batch1_gene_means_internal, probs = c(0, 0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99, 1), na.rm = TRUE))
+
+feature_rank_internal <- order(batch1_gene_means_internal, decreasing = TRUE)
+actual_top_n_internal <- min(top_n_features, length(feature_rank_internal))
+selected_genes_internal <- names(batch1_gene_means_internal)[feature_rank_internal[seq_len(actual_top_n_internal)]]
+
+cat("Selected genes based on GSE13067-only mean expression:", length(selected_genes_internal), "\n")
+cat("Selected gene preview:\n")
+print(head(selected_genes_internal, 30))
+
+feature_check_internal <- tibble::tibble(
+  gene = names(batch1_gene_means_internal),
+  gse13294_batch1_mean = as.numeric(batch1_gene_means_internal),
+  selected = names(batch1_gene_means_internal) %in% selected_genes_internal
+) |>
+  dplyr::arrange(desc(gse13294_batch1_mean))
+
+readr::write_csv(feature_check_internal, file.path(result_dir, "feature_selection_gse13067_only_check.csv"))
+
+hist(
+  batch1_gene_means_internal,
+  breaks = 200,
+  main = "GSE13294-only gene mean distribution for feature selection",
+  xlab = "Mean expression in GSE13294 only",
+  col = "grey85",
+  border = "white"
+)
+abline(v = min(batch1_gene_means_internal[selected_genes_internal], na.rm = TRUE), col = "red", lwd = 2)
+legend(
+  "topright",
+  legend = paste0("top_n = ", length(selected_genes_internal)),
+  col = "red",
+  lwd = 2,
+  bty = "n"
+)
+```
+
+```{r}
+############################################################
+## 8.5) Poor-marker / negative-control marker boxplot by batch
+############################################################
+## Boxplot of poor-marker reads by batch
+## Batch 1 = GSE13294
+## Batch 2 = GSE13067
+##
+## Important:
+## This plot is made BEFORE cross-platform alignment.
+## It is for diagnostic visualization only and is not used in ml_sum().
+############################################################
+
+## 0) Specify the two pre-alignment expression matrices
+## rows = genes
+## cols = samples
+
+poor_batch1_mat <- gse13294_common_matched_internal
+poor_batch2_mat <- gse13067_common_matched_internal
+
+batch1_name <- "13294"
+batch2_name <- "13067"
+
+cat("Batch 1 matrix dimension: GSE13294\n")
+print(dim(poor_batch1_mat))
+
+cat("Batch 2 matrix dimension: GSE13067\n")
+print(dim(poor_batch2_mat))
+
+## 1) Define poor markers
+## Prefer TCGA training means if train_gene_means already exists.
+## This keeps poor-marker definition consistent with the original workflow.
+## If train_gene_means does not exist, define poor markers from the combined GSE matrix.
+
+common_poor_genes <- intersect(rownames(poor_batch1_mat), rownames(poor_batch2_mat))
+
+if (exists("train_gene_means")) {
+  poor_gene_means_source <- train_gene_means[
+    intersect(names(train_gene_means), common_poor_genes)
+  ]
+  cat("Poor markers are defined using TCGA training mean expression.\n")
+} else {
+  poor_gene_means_source <- rowMeans(
+    cbind(
+      poor_batch1_mat[common_poor_genes, , drop = FALSE],
+      poor_batch2_mat[common_poor_genes, , drop = FALSE]
+    ),
+    na.rm = TRUE
+  )
+  cat("train_gene_means not found. Poor markers are defined using combined GSE mean expression.\n")
+}
+
+poor_q_low  <- 0.10
+poor_q_high <- 0.30
+
+poor_lower <- quantile(poor_gene_means_source, probs = poor_q_low,  na.rm = TRUE)
+poor_upper <- quantile(poor_gene_means_source, probs = poor_q_high, na.rm = TRUE)
+
+poor_genes <- names(poor_gene_means_source)[
+  poor_gene_means_source >= poor_lower &
+    poor_gene_means_source <= poor_upper
+]
+
+## Exclude ML-selected high-expression features if selected_genes exists.
+if (exists("selected_genes")) {
+  poor_genes <- setdiff(poor_genes, selected_genes)
+}
+
+## Keep only genes available in both GSE datasets
+poor_genes <- intersect(poor_genes, common_poor_genes)
+
+cat("\nPoor-marker definition:\n")
+cat("Mean-expression quantile window:", poor_q_low, "to", poor_q_high, "\n")
+cat("Poor-marker mean lower bound:", poor_lower, "\n")
+cat("Poor-marker mean upper bound:", poor_upper, "\n")
+cat("Number of poor markers:", length(poor_genes), "\n")
+
+if (length(poor_genes) < 20) {
+  stop("Too few poor markers. Widen the quantile window, e.g. 0.10 to 0.50.")
+}
+
+## 2) Build poor-marker matrix before cross-platform alignment
+
+batch1_poor <- poor_batch1_mat[poor_genes, , drop = FALSE]  # GSE13294
+batch2_poor <- poor_batch2_mat[poor_genes, , drop = FALSE]  # GSE13067
+
+poor_mat_13294_13067 <- cbind(batch1_poor, batch2_poor)
+
+batch_poor_13294_13067 <- factor(
+  c(rep(batch1_name, ncol(batch1_poor)),
+    rep(batch2_name, ncol(batch2_poor))),
+  levels = c(batch1_name, batch2_name)
+)
+
+stopifnot(ncol(poor_mat_13294_13067) == length(batch_poor_13294_13067))
+
+## 3) Remove non-finite values
+
+poor_mat_13294_13067[!is.finite(poor_mat_13294_13067)] <- NA
+
+cat("\nFinite values per sample summary:\n")
+print(summary(colSums(is.finite(as.matrix(poor_mat_13294_13067)))))
+
+cat("All-NA samples:\n")
+print(sum(colSums(is.finite(as.matrix(poor_mat_13294_13067))) == 0))
+
+## 4) Order samples by batch
+## Batch order will be:
+##   left  = 13294
+##   right = 13067
+
+ord_13294_13067 <- order(batch_poor_13294_13067)
+
+poor_mat_13294_13067 <- poor_mat_13294_13067[, ord_13294_13067, drop = FALSE]
+batch_poor_13294_13067 <- batch_poor_13294_13067[ord_13294_13067]
+
+## 5) Compute boxplot range
+
+bp_13294_13067 <- boxplot(
+  as.data.frame(poor_mat_13294_13067),
+  plot = FALSE,
+  outline = FALSE
+)
+
+ylim_use_13294_13067 <- range(bp_13294_13067$stats, na.rm = TRUE)
+
+## 6) Background blocks for the two batches
+
+batch_runs_13294_13067 <- rle(as.character(batch_poor_13294_13067))
+batch_end_13294_13067 <- cumsum(batch_runs_13294_13067$lengths)
+batch_start_13294_13067 <- c(1, head(batch_end_13294_13067, -1) + 1)
+
+## Grey / white background blocks
+bg_cols_13294_13067 <- c(
+  "13294" = "grey92",
+  "13067" = "white"
+)
+
+## Box colors by batch
+box_cols_13294_13067 <- c(
+  "13294" = "#00BFC4",
+  "13067" = "#F8766D"
+)
+
+sample_box_cols_13294_13067 <- adjustcolor(
+  box_cols_13294_13067[as.character(batch_poor_13294_13067)],
+  alpha.f = 0.45
+)
+
+sample_border_cols_13294_13067 <- adjustcolor(
+  box_cols_13294_13067[as.character(batch_poor_13294_13067)],
+  alpha.f = 0.75
+)
+
+legend_box_cols_13294_13067 <- adjustcolor(
+  unname(box_cols_13294_13067),
+  alpha.f = 0.75
+)
+names(legend_box_cols_13294_13067) <- names(box_cols_13294_13067)
+
+## Check color matching
+
+if (any(is.na(sample_box_cols_13294_13067)) ||
+    any(is.na(sample_border_cols_13294_13067))) {
+  stop("Some samples do not have assigned colors. Check batch labels and box_cols_13294_13067 names.")
+}
+
+cat("\nBatch counts after ordering:\n")
+print(table(batch_poor_13294_13067))
+
+## 7) Define one plotting function to avoid screen/png mismatch
+
+draw_poor_boxplot_13294_13067 <- function() {
+  old_par <- par(no.readonly = TRUE)
+  on.exit(par(old_par))
+  
+  par(mar = c(5, 5, 4, 2))
+  
+  plot(
+    NA,
+    xlim = c(0.5, ncol(poor_mat_13294_13067) + 0.5),
+    ylim = ylim_use_13294_13067,
+    xaxt = "n",
+    xlab = "Samples ordered by batch",
+    ylab = "Poor-marker log-transformed expression",
+    main = "Poor-marker expression distribution by batch"
+  )
+  
+  ## Background color by batch
+  for (i in seq_along(batch_runs_13294_13067$values)) {
+    this_batch <- batch_runs_13294_13067$values[i]
+    rect(
+      xleft = batch_start_13294_13067[i] - 0.5,
+      ybottom = par("usr")[3],
+      xright = batch_end_13294_13067[i] + 0.5,
+      ytop = par("usr")[4],
+      col = bg_cols_13294_13067[this_batch],
+      border = NA
+    )
+  }
+  
+  ## One box per sample
+  boxplot(
+    as.data.frame(poor_mat_13294_13067),
+    add = TRUE,
+    outline = FALSE,
+    xaxt = "n",
+    col = sample_box_cols_13294_13067,
+    border = sample_border_cols_13294_13067,
+    boxwex = 0.35,
+    lwd = 0.6,
+    medlwd = 0.6,
+    whisklty = 1,
+    staplelty = 1
+  )
+  
+  ## Separator between batch 1 and batch 2
+  abline(
+    v = batch_end_13294_13067[1] + 0.5,
+    lty = 2,
+    col = "grey40",
+    lwd = 1
+  )
+  
+  ## Batch labels on x-axis
+  axis(
+    side = 1,
+    at = (batch_start_13294_13067 + batch_end_13294_13067) / 2,
+    labels = batch_runs_13294_13067$values,
+    tick = FALSE,
+    cex.axis = 0.9
+  )
+  
+  legend(
+    "right",
+    legend = names(box_cols_13294_13067),
+    fill = legend_box_cols_13294_13067,
+    border = box_cols_13294_13067,
+    bty = "n",
+    title = "Batch",
+    cex = 0.85,
+    inset = c(0.01, 0)
+  )
+}
+
+## 8) Plot on screen
+
+draw_poor_boxplot_13294_13067()
+
+## 9) Save plot using exactly the same function
+
+outfile_13294_13067 <- file.path(
+  result_dir,
+  "poor_marker_boxplot_GSE13294_vs_GSE13067_before_alignment.png"
+)
+
+png(
+  filename = outfile_13294_13067,
+  width = 4200,
+  height = 1500,
+  res = 300
+)
+
+draw_poor_boxplot_13294_13067()
+
+dev.off()
+
+cat("Saved poor-marker boxplot to:\n")
+cat(outfile_13294_13067, "\n")
+```
+
+# 9) Internal-platform alignment and final ml_sum input
+
+```{r internal-alignment-final-input}
+gse13067_selected_internal <- gse13067_common_matched_internal[selected_genes_internal, , drop = FALSE]
+gse13294_selected_internal <- gse13294_common_matched_internal[selected_genes_internal, , drop = FALSE]
+
+matrix_diagnostics(gse13067_selected_internal, "GSE13067 selected genes before internal alignment")
+matrix_diagnostics(gse13294_selected_internal, "GSE13294 selected genes before internal alignment")
+
+aligned_internal <- apply_internal_alignment(
+  batch1_mat = gse13294_selected_internal,
+  batch2_mat = gse13067_selected_internal,
+  method = internal_alignment_method
+)
+
+gse13294_aligned_internal <- aligned_internal$batch1
+gse13067_aligned_internal <- aligned_internal$batch2
+
+matrix_diagnostics(gse13067_aligned_internal, paste0("GSE13067 after internal alignment: ", internal_alignment_method))
+matrix_diagnostics(gse13294_aligned_internal, paste0("GSE13294 after internal alignment: ", internal_alignment_method))
+
+data_final_internal <- cbind(gse13294_aligned_internal, gse13067_aligned_internal)
+
+class_id_binary_internal <- factor(
+  c(gse13294_meta_internal$class_id, gse13067_meta_internal$class_id),
+  levels = c(0, 1)
+)
+
+batch_id_final_internal <- c(
+  rep(1, ncol(gse13294_aligned_internal)),
+  rep(2, ncol(gse13067_aligned_internal))
+)
+names(batch_id_final_internal) <- colnames(data_final_internal)
+
+sample_meta_final_internal <- tibble::tibble(
+  sample = colnames(data_final_internal),
+  dataset = c(rep(batch1_dataset_name, ncol(gse13294_aligned_internal)), rep(batch2_dataset_name, ncol(gse13067_aligned_internal))),
+  batch_id = batch_id_final_internal,
+  CMS = c(gse13294_meta_internal$CMS, gse13067_meta_internal$CMS),
+  CMS_binary = ifelse(as.character(class_id_binary_internal) == "1", binary_positive_class, binary_negative_class),
+  class_id = as.character(class_id_binary_internal)
+)
+
+bad_removed_internal <- remove_bad_features(data_final_internal)
+data_final_clean_internal <- bad_removed_internal$data
+
+cat("Combined data_final_internal dim before bad-feature removal:", paste(dim(data_final_internal), collapse = " x "), "\n")
+cat("Combined data_final_clean_internal dim after bad-feature removal:", paste(dim(data_final_clean_internal), collapse = " x "), "\n")
+cat("Removed bad features:", nrow(data_final_internal) - nrow(data_final_clean_internal), "\n")
+
+stopifnot(
+  ncol(data_final_clean_internal) == length(class_id_binary_internal),
+  ncol(data_final_clean_internal) == length(batch_id_final_internal),
+  identical(colnames(data_final_clean_internal), names(batch_id_final_internal)),
+  !anyNA(class_id_binary_internal),
+  all(class_id_binary_internal %in% c(0, 1))
+)
+
+cat("Final class x batch table:\n")
+print(table(class_id_binary_internal, batch_id_final_internal))
+cat("Final CMS x batch table:\n")
+print(table(sample_meta_final_internal$CMS, sample_meta_final_internal$batch_id))
+
+matrix_diagnostics(data_final_clean_internal, "Final data passed into ml_sum")
+
+readr::write_csv(sample_meta_final_internal, file.path(result_dir, "sample_meta_final_internal.csv"))
+write.table(
+  data.frame(gene = rownames(data_final_clean_internal)),
+  file = file.path(result_dir, "final_feature_genes_internal.txt"),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+```
+
+# 10) PCA check before ML
+
+```{r pca-check, fig.width=8, fig.height=6}
+pca_input_internal <- t(data_final_clean_internal)
+pca_input_internal[!is.finite(pca_input_internal)] <- 0
+pca_fit_internal <- prcomp(pca_input_internal, center = TRUE, scale. = FALSE)
+
+pca_df_internal <- data.frame(
+  sample = rownames(pca_fit_internal$x),
+  PC1 = pca_fit_internal$x[, 1],
+  PC2 = pca_fit_internal$x[, 2]
+) |>
+  dplyr::left_join(sample_meta_final_internal, by = "sample")
+
+p_pca_internal <- ggplot(pca_df_internal, aes(x = PC1, y = PC2, color = factor(batch_id), shape = CMS_binary)) +
+  geom_point(size = 2.2, alpha = 0.85) +
+  labs(
+    title = paste0("PCA check: GSE13067 vs GSE13294, alignment = ", internal_alignment_method),
+    color = "batch",
+    shape = "class"
+  ) +
+  theme_bw()
+print(p_pca_internal)
+
+ggplot2::ggsave(
+  filename = file.path(result_dir, paste0("pca_before_ml_alignment_", internal_alignment_method, ".png")),
+  plot = p_pca_internal,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+```{r}
+############################################################
+## 9.5) Post-alignment diagnostic-feature boxplot by batch
+############################################################
+## Purpose:
+##   Explain why the ml_sum() error curve is meaningful under
+##   the batch definition:
+##     Batch 1 = GSE13294
+##     Batch 2 = GSE13067
+##
+## Important:
+##   This plot is made AFTER cross-platform alignment.
+##   It uses data_final_clean, which is the same matrix passed
+##   into ml_sum().
+##
+## Note:
+##   Section 9 aligns only selected_genes, so the original poor_genes
+##   from #8.5 are usually not available after alignment.
+##   Therefore, this cell uses a low-to-middle expression diagnostic
+##   subset from the aligned features that actually enter ml_sum().
+############################################################
+
+## 0) Required post-alignment objects
+if (!exists("data_final_clean_internal")) {
+  stop("Cannot find data_final_clean_internal. Run Section 9 cross-platform alignment first.")
+}
+
+if (!exists("batch_id_final_internal")) {
+  stop("Cannot find batch_id_final_internal. Run Section 9 cross-platform alignment first.")
+}
+
+if (!exists("batch1_gene_means_internal")) {
+  stop("Cannot find batch1_gene_means_internal. Run Section 8 feature selection first.")
+}
+
+if (!exists("selected_genes_internal")) {
+  stop("Cannot find selected_genes_internal. Run Section 8 feature selection first.")
+}
+
+stopifnot(
+  ncol(data_final_clean_internal) == length(batch_id_final_internal),
+  identical(colnames(data_final_clean_internal), names(batch_id_final_internal))
+)
+
+cat("Post-alignment matrix used by ml_sum:\n")
+print(dim(data_final_clean_internal))
+
+cat("Batch counts in data_final_clean:\n")
+print(table(batch_id_final_internal))
+
+## 1) Define diagnostic features from aligned ml_sum input
+## Because data_final_clean only contains selected_genes, we select
+## the lower-to-middle expression subset among the available aligned
+## ml_sum features, based on training-cohort gene means.
+
+pa_gse_available_genes <- intersect(rownames(data_final_clean_internal), names(batch1_gene_means_internal))
+
+pa_gse_feature_means <- batch1_gene_means_internal[pa_gse_available_genes]
+
+## Low-to-middle window among available ml_sum features.
+## This is not the same as #8.5 raw poor_genes.
+## It is a post-alignment diagnostic subset from features that enter ml_sum().
+pa_gse_q_low  <- 0.10
+pa_gse_q_high <- 0.40
+
+pa_gse_lower <- quantile(pa_gse_feature_means, probs = pa_gse_q_low,  na.rm = TRUE)
+pa_gse_upper <- quantile(pa_gse_feature_means, probs = pa_gse_q_high, na.rm = TRUE)
+
+pa_gse_diag_genes <- names(pa_gse_feature_means)[
+  pa_gse_feature_means >= pa_gse_lower &
+    pa_gse_feature_means <= pa_gse_upper
+]
+
+cat("\nPost-alignment diagnostic-feature definition:\n")
+cat("Feature source: data_final_clean rows, i.e. features entering ml_sum()\n")
+cat("Training mean-expression quantile window among aligned features:",
+    pa_gse_q_low, "to", pa_gse_q_high, "\n")
+cat("Diagnostic-feature mean lower bound:", pa_gse_lower, "\n")
+cat("Diagnostic-feature mean upper bound:", pa_gse_upper, "\n")
+cat("Number of diagnostic features:", length(pa_gse_diag_genes), "\n")
+
+## Fallback: if too few features, use all aligned ml_sum features
+if (length(pa_gse_diag_genes) < 20) {
+  warning(
+    paste0(
+      "Fewer than 20 diagnostic features found. ",
+      "Using all data_final_clean features for the post-alignment boxplot."
+    )
+  )
+  pa_gse_diag_genes <- rownames(data_final_clean_internal)
+}
+
+## 2) Build post-alignment diagnostic matrix
+pa_gse_diag_mat <- data_final_clean_internal[pa_gse_diag_genes, , drop = FALSE]
+
+## Batch labels:
+##   batch_id_final == 1 means GSE13294
+##   batch_id_final == 2 means GSE13067
+pa_gse_batch <- factor(
+  ifelse(batch_id_final_internal == 1, "GSE13294", "GSE13067"),
+  levels = c("GSE13294", "GSE13067")
+)
+
+stopifnot(ncol(pa_gse_diag_mat) == length(pa_gse_batch))
+
+## 3) Remove non-finite values
+pa_gse_diag_mat[!is.finite(pa_gse_diag_mat)] <- NA
+
+cat("\nFinite values per sample summary in post-alignment diagnostic matrix:\n")
+print(summary(colSums(is.finite(as.matrix(pa_gse_diag_mat)))))
+
+cat("All-NA samples:\n")
+print(sum(colSums(is.finite(as.matrix(pa_gse_diag_mat))) == 0))
+
+## 4) Order samples by batch
+pa_gse_ord <- order(pa_gse_batch)
+
+pa_gse_diag_mat_ordered <- pa_gse_diag_mat[, pa_gse_ord, drop = FALSE]
+pa_gse_batch_ordered <- pa_gse_batch[pa_gse_ord]
+
+## 5) Compute boxplot range
+pa_gse_bp <- boxplot(
+  as.data.frame(pa_gse_diag_mat_ordered),
+  plot = FALSE,
+  outline = FALSE
+)
+
+pa_gse_ylim_use <- range(pa_gse_bp$stats, na.rm = TRUE)
+
+## 6) Background blocks for the two batches
+pa_gse_batch_runs <- rle(as.character(pa_gse_batch_ordered))
+pa_gse_batch_end <- cumsum(pa_gse_batch_runs$lengths)
+pa_gse_batch_start <- c(1, head(pa_gse_batch_end, -1) + 1)
+
+pa_gse_bg_cols <- c(
+  "GSE13294" = "grey92",
+  "GSE13067" = "white"
+)
+
+pa_gse_box_cols <- c(
+  "GSE13294" = "#00BFC4",
+  "GSE13067" = "#F8766D"
+)
+
+pa_gse_sample_box_cols <- adjustcolor(
+  pa_gse_box_cols[as.character(pa_gse_batch_ordered)],
+  alpha.f = 0.45
+)
+
+pa_gse_sample_border_cols <- adjustcolor(
+  pa_gse_box_cols[as.character(pa_gse_batch_ordered)],
+  alpha.f = 0.75
+)
+
+pa_gse_legend_box_cols <- adjustcolor(
+  unname(pa_gse_box_cols),
+  alpha.f = 0.75
+)
+names(pa_gse_legend_box_cols) <- names(pa_gse_box_cols)
+
+if (any(is.na(pa_gse_sample_box_cols)) || any(is.na(pa_gse_sample_border_cols))) {
+  stop("Some samples do not have assigned colors. Check pa_gse_batch_ordered and pa_gse_box_cols.")
+}
+
+cat("\nPost-alignment batch counts used for plotting:\n")
+print(table(pa_gse_batch_ordered))
+
+## 7) Define one plotting function to avoid RStudio/png mismatch
+pa_gse_draw_post_alignment_boxplot <- function() {
+  pa_gse_old_par <- par(no.readonly = TRUE)
+  on.exit(par(pa_gse_old_par))
+  
+  par(mar = c(5, 5, 4, 2))
+  
+  plot(
+    NA,
+    xlim = c(0.5, ncol(pa_gse_diag_mat_ordered) + 0.5),
+    ylim = pa_gse_ylim_use,
+    xaxt = "n",
+    xlab = "Samples ordered by batch",
+    ylab = "Post-alignment diagnostic-feature expression",
+    main = "Post-alignment feature distribution by batch"
+  )
+  
+  ## Background color by batch
+  for (pa_gse_i in seq_along(pa_gse_batch_runs$values)) {
+    pa_gse_this_batch <- pa_gse_batch_runs$values[pa_gse_i]
+    rect(
+      xleft = pa_gse_batch_start[pa_gse_i] - 0.5,
+      ybottom = par("usr")[3],
+      xright = pa_gse_batch_end[pa_gse_i] + 0.5,
+      ytop = par("usr")[4],
+      col = pa_gse_bg_cols[pa_gse_this_batch],
+      border = NA
+    )
+  }
+  
+  ## One box per sample
+  boxplot(
+    as.data.frame(pa_gse_diag_mat_ordered),
+    add = TRUE,
+    outline = FALSE,
+    xaxt = "n",
+    col = pa_gse_sample_box_cols,
+    border = pa_gse_sample_border_cols,
+    boxwex = 0.35,
+    lwd = 0.6,
+    medlwd = 0.6,
+    whisklty = 1,
+    staplelty = 1
+  )
+  
+  ## Separator between GSE13294 and GSE13067
+  abline(
+    v = pa_gse_batch_end[1] + 0.5,
+    lty = 2,
+    col = "grey40",
+    lwd = 1
+  )
+  
+  ## Batch labels on x-axis
+  axis(
+    side = 1,
+    at = (pa_gse_batch_start + pa_gse_batch_end) / 2,
+    labels = pa_gse_batch_runs$values,
+    tick = FALSE,
+    cex.axis = 0.9
+  )
+  
+  legend(
+    "right",
+    legend = names(pa_gse_box_cols),
+    fill = pa_gse_legend_box_cols,
+    border = pa_gse_box_cols,
+    bty = "n",
+    title = "Batch",
+    cex = 0.85,
+    inset = c(0.01, 0)
+  )
+}
+
+## 8) Plot on screen
+pa_gse_draw_post_alignment_boxplot()
+
+## 9) Save plot
+pa_gse_outfile <- file.path(
+  result_dir,
+  "post_alignment_diagnostic_feature_boxplot_GSE13294_vs_GSE13067.png"
+)
+
+png(
+  filename = pa_gse_outfile,
+  width = 4200,
+  height = 1500,
+  res = 300
+)
+
+pa_gse_draw_post_alignment_boxplot()
+
+dev.off()
+
+cat("Saved post-alignment diagnostic-feature boxplot to:\n")
+cat(pa_gse_outfile, "\n")
+```
+
+# 11) Run ml_sum from SSV summary.R
+
+```{r run-ml-sum}
+cat("Running ml_sum() using SSV summary.R.\n")
+cat("data_type_rnaseq = FALSE because the input is RMA microarray continuous expression.\n")
+cat("batch_time = TRUE and early_batch_id = c(1), so split=100 means GSE13067-only training and GSE13294-only testing.\n")
+cat("batch_balance =", batch_balance, "keeps the original matched sample sizes.\n")
+
+start_time <- Sys.time()
+
+ml_sum(
+  n = times,
+  data = data_final_clean_internal,
+  class = class_id_binary_internal,
+  batch = batch_id_final_internal,
+  batch_time = TRUE,
+  early_batch_id = c(1),
+  batch_balance = batch_balance,
+  ml = ml_methods,
+  split_combination = split_combination,
+  data_type_rnaseq = FALSE,
+  file = file_prefix
+)
+
+end_time <- Sys.time()
+run_time <- end_time - start_time
+cat("ml_sum run time:\n")
+print(run_time)
+```
+
+# 12) Check ml_sum output files
+
+```{r check-output-files}
+expected_files_internal <- paste(
+  file_prefix,
+  times,
+  ml_methods,
+  "batch_balance",
+  batch_balance,
+  "result.csv",
+  sep = "_"
+)
+
+cat("Expected ml_sum output files:\n")
+print(expected_files_internal)
+
+missing_files_internal <- expected_files_internal[!file.exists(expected_files_internal)]
+if (length(missing_files_internal) > 0) {
+  cat("Missing files:\n")
+  print(missing_files_internal)
+  stop("Some ml_sum output files are missing.")
+}
+
+cat("All ml_sum output files exist.\n")
+
+for (f in expected_files_internal) {
+  cat("\nPreview:", f, "\n")
+  tmp <- read.csv(f, sep = "\t", check.names = FALSE)
+  print(dim(tmp))
+  print(head(tmp))
+}
+```
+
+# 13) Plot using result_plot2 from SSV summary.R
+
+```{r plot-result, fig.width=12, fig.height=8}
+p_internal <- result_plot2(
+  n = times,
+  ml = ml_methods,
+  file = file_prefix,
+  batch_balance = batch_balance,
+  data_type_rnaseq = FALSE,
+  split_combination = split_combination
+)
+
+if (exists("p_internal") && inherits(p_internal, "ggplot")) {
+  ggplot2::ggsave(
+    filename = file.path(result_dir, "deepcc_gse13067_to_gse13294_CMS4_vs_Others_internal_platform_error_curve.png"),
+    plot = p_internal,
+    width = 12,
+    height = 8,
+    dpi = 300
+  )
+} else {
+  ggplot2::ggsave(
+    filename = file.path(result_dir, "deepcc_gse13067_to_gse13294_CMS4_vs_Others_internal_platform_error_curve.png"),
+    width = 12,
+    height = 8,
+    dpi = 300
+  )
+}
+
+cat("Saved plot:", file.path(result_dir, "deepcc_gse13067_to_gse13294_CMS4_vs_Others_internal_platform_error_curve.png"), "\n")
+```
+
+# 14) Final integrity checks
+
+```{r final-checks}
+stopifnot(nrow(data_final_clean_internal) > 0)
+stopifnot(ncol(data_final_clean_internal) == length(class_id_binary_internal))
+stopifnot(ncol(data_final_clean_internal) == length(batch_id_final_internal))
+stopifnot(all(levels(class_id_binary_internal) == c("0", "1")))
+stopifnot(all(batch_id_final_internal %in% c(1, 2)))
+stopifnot(length(expected_files_internal) == length(ml_methods))
+stopifnot(all(file.exists(expected_files_internal)))
+
+cat("Final checks passed.\n")
+cat("Interpretation note:\n")
+cat("This is a binary adaptation of DeepCC CRC scenario 1: CMS4 vs Others.\n")
+cat("This internal-platform version uses two RMA microarray cohorts: batch 1 = GSE13067, batch 2 = GSE13294.\n")
+cat("The strict split=100 setting means GSE13067-only training and GSE13294-only testing.\n")
+cat("Because both inputs are RMA microarray data, internal_alignment_method is set to 'none' by default.\n")
+```
