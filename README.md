@@ -2,7 +2,7 @@
 
 **Batch-aware validation for molecular classification under cohort and platform shift.**
 
-## Motivation
+## 🧠 Motivation
 
 Random train/test splits can mix samples from different batches, cohorts, or platforms across both sets and therefore produce overly optimistic performance estimates.
 
