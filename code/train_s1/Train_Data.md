@@ -1,6 +1,7 @@
 # Training Data
 
-This folder contains the source training expression dataset used in the R workflow.
+> **Note:** The expression data file is too large to be included in this repository.  
+> The original study cited below provides access to the corresponding dataset and download resources.
 
 ## File
 
